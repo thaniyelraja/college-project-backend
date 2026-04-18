@@ -14,7 +14,7 @@ import java.util.List;
 @RequestMapping("/trips/{tripId}/tracker")
 @RequiredArgsConstructor
 @Slf4j
-@CrossOrigin(origins = "http://localhost:3000")
+
 public class ExpenseTrackerController {
 
     private final ExpenseTrackerService service;

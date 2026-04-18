@@ -75,7 +75,7 @@ public class AiFallbackService {
 
             HttpRequest request = HttpRequest.newBuilder()
                 .uri(URI.create("https://api.groq.com/openai/v1/chat/completions"))
-                .timeout(Duration.ofSeconds(90))
+                .timeout(Duration.ofSeconds(25))
                 .header("Content-Type", "application/json")
                 .header("Authorization", "Bearer " + key)
                 .POST(HttpRequest.BodyPublishers.ofString(objectMapper.writeValueAsString(body)))
@@ -102,7 +102,7 @@ public class AiFallbackService {
 
         HttpRequest request = HttpRequest.newBuilder()
             .uri(URI.create("https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=" + key))
-            .timeout(Duration.ofSeconds(90))
+            .timeout(Duration.ofSeconds(20))
             .header("Content-Type", "application/json")
             .POST(HttpRequest.BodyPublishers.ofString(objectMapper.writeValueAsString(body)))
             .build();
@@ -133,7 +133,7 @@ public class AiFallbackService {
 
         HttpRequest request = HttpRequest.newBuilder()
             .uri(URI.create("https://openrouter.ai/api/v1/chat/completions"))
-            .timeout(Duration.ofSeconds(90))
+            .timeout(Duration.ofSeconds(20))
             .header("Content-Type", "application/json")
             .header("Authorization", "Bearer " + key)
             .POST(HttpRequest.BodyPublishers.ofString(objectMapper.writeValueAsString(body)))
@@ -167,10 +167,11 @@ public class AiFallbackService {
     public List<Activity> generateFallbackPlaces(String destination, double centerLat, double centerLng, int count, String activeKinds) {
         log.warn("Executing Emergency AI POI Generation for {} ({} places needed)", destination, count);
         String sys = "You are an emergency geolocation API. The user needs exactly " + count + " prominent, real tourist attractions or landmarks in/around " + destination + ". " +
+                     "CRITICAL: Do NOT return hospitals, clinics, schools, colleges, academies, bus stops, transit stations, ATMs, banks, or corporate offices. Only return places of leisure, culture, nature, or historic interest. " +
                      "Return exactly " + count + " places as JSON. Provide highly accurate GPS coordinates near lat: " + centerLat + ", lng: " + centerLng + ". " +
                      "Requested categories (use as hint): " + activeKinds + ".\n" +
                      "Format MUST BE: {\"places\": [{\"name\":\"String\",\"lat\":0.0,\"lng\":0.0,\"rate\":7.5,\"kinds\":\"historic,cultural\"}]}";
-        String prompt = "Generate " + count + " strictly real places for " + destination + ". Spread them out logically.";
+        String prompt = "Generate " + count + " strict tourist attractions for " + destination + ". Spread them out logically. No hospitals. No schools. No bus stops.";
         
         String aiJson = callAi(sys, prompt);
         List<Activity> list = new ArrayList<>();

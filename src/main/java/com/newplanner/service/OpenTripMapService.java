@@ -32,7 +32,7 @@ public class OpenTripMapService {
 
         return keyService.tryWithFallback(keyService.getOtmKeys(), key -> {
             String urlStr = String.format(
-                "https://api.opentripmap.com/0.1/en/places/radius?radius=%s&lon=%s&lat=%s&kinds=%s&limit=200&format=geojson&apikey=%s",
+                "https://api.opentripmap.com/0.1/en/places/radius?radius=%s&lon=%s&lat=%s&kinds=%s&rate=1&limit=200&format=geojson&apikey=%s",
                 radius, lng, lat, kindsParam, key);
 
             System.out.println("OTM fetch → kinds: " + kindsParam);

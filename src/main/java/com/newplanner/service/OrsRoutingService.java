@@ -44,6 +44,79 @@ public class OrsRoutingService {
     }
 
     /**
+     * ORS Optimization API (VRP/TSP)
+     * Takes a list of activities and returns a geometrically optimized sequence.
+     * Starts the route at the first activity in the list.
+     */
+    public List<com.newplanner.entity.Activity> optimizeRoute(List<com.newplanner.entity.Activity> places) {
+        if (places == null || places.size() <= 2) return places;
+        int n = places.size();
+
+        try {
+            return keyService.tryWithFallback(keyService.getOrsKeys(), key -> {
+                // 1. Build jobs (all places)
+                List<Map<String, Object>> jobs = new ArrayList<>();
+                for (int i = 0; i < n; i++) {
+                    jobs.add(Map.of("id", i, "location", List.of(places.get(i).getLongitude(), places.get(i).getLatitude())));
+                }
+
+                // 2. Build one vehicle starting at the first place
+                List<Map<String, Object>> vehicles = new ArrayList<>();
+                vehicles.add(Map.of(
+                    "id", 1,
+                    "profile", "driving-car",
+                    "start", List.of(places.get(0).getLongitude(), places.get(0).getLatitude())
+                ));
+
+                Map<String, Object> body = Map.of("jobs", jobs, "vehicles", vehicles);
+
+                HttpHeaders headers = new HttpHeaders();
+                headers.setContentType(MediaType.APPLICATION_JSON);
+                headers.set("Authorization", key);
+                HttpEntity<Map<String, Object>> entity = new HttpEntity<>(body, headers);
+
+                ResponseEntity<String> response = restTemplate.postForEntity(
+                    "https://api.openrouteservice.org/optimization", entity, String.class);
+
+                if (!response.getStatusCode().is2xxSuccessful() || response.getBody() == null) {
+                    throw new RuntimeException("ORS Optimization HTTP " + response.getStatusCode());
+                }
+
+                JsonNode root = objectMapper.readTree(response.getBody());
+                JsonNode routes = root.path("routes");
+                if (!routes.isArray() || routes.isEmpty()) {
+                    throw new RuntimeException("ORS Optimization: empty routes array");
+                }
+
+                JsonNode steps = routes.get(0).path("steps");
+                if (!steps.isArray()) throw new RuntimeException("ORS Optimization: empty steps array");
+
+                List<com.newplanner.entity.Activity> optimizedSequence = new ArrayList<>();
+                for (JsonNode step : steps) {
+                    if ("job".equals(step.path("type").asText())) {
+                        int jobId = step.path("id").asInt();
+                        optimizedSequence.add(places.get(jobId));
+                    }
+                }
+
+                // If some jobs were omitted (unroutable), append them at the end safely
+                if (optimizedSequence.size() < places.size()) {
+                    for (com.newplanner.entity.Activity p : places) {
+                        if (!optimizedSequence.contains(p)) optimizedSequence.add(p);
+                    }
+                }
+
+                log.info("ORS Optimization successful for {} places.", places.size());
+                return optimizedSequence;
+            });
+        } catch (Exception e) {
+            log.warn("ORS Optimization skipped/failed — falling back to pipeline logic. Reason: {}", e.getMessage());
+            return null; // Will fallback gracefully in pipeline
+        }
+    }
+
+
+    /**
      * ORS Matrix API — ONE call for all N consecutive transit durations.
      * Falls back through all ORS keys if any one fails.
      * Returns String[] where index i = transit label from place[i] → place[i+1].

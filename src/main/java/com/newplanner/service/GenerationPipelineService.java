@@ -43,25 +43,37 @@ public class GenerationPipelineService {
     private final ObjectMapper objectMapper = new ObjectMapper();
 
     // ─── Interest Key → OTM kinds mapping (matches frontend Step2Preferences keys) ─
-    // Curious (1) or Interested (2) = kinds INCLUDED in OTM request
-    // Not Interested (0)            = kinds NOT included in OTM request at all
+    // Used ONLY for post-fetch filtering: blocked (score=0) and priority boost (score=2).
+    // OTM fetch always uses 'interesting_places' as the umbrella — sub-kinds filter the response.
+    // Valid OTM sub-category names (dot-notation parents → sub kinds accepted by API):
+    //   historic → castles, monuments, churches, archaeological_sites
+    //   cultural → museums, theatres, cinemas, libraries
+    //   natural  → natural_springs, natural_water, natural_peaks, beaches
+    //   amusements → amusements (top-level OK)
+    //   sport → sport (top-level OK)
+    //   shops → shops (top-level OK)
+    //   foods → foods (top-level OK)
     private static final Map<String, String[]> INTEREST_OTM_MAP = Map.of(
-        "historyculture", new String[]{"historic", "cultural"},
-        "nature",         new String[]{"natural"},
-        "entertainment",  new String[]{"amusements"},
-        "food",           new String[]{"catering"},
+        "historyculture", new String[]{"historic", "cultural", "monuments", "archaeological_sites", "castles", "churches", "museums"},
+        "nature",         new String[]{"natural", "natural_springs", "natural_water", "natural_peaks", "beaches"},
+        "entertainment",  new String[]{"amusements", "theatres", "cinemas"},
+        "food",           new String[]{"foods"},
         "sports",         new String[]{"sport"},
         "shopping",       new String[]{"shops"},
-        "adventure",      new String[]{"natural", "amusements", "sport"},
-        "relaxing",       new String[]{"natural", "interesting_places"}
+        "adventure",      new String[]{"amusements", "sport", "natural"},
+        "relaxing",       new String[]{"natural", "beaches", "gardens"}
     );
 
     @Async
     public CompletableFuture<Itinerary> orchestrateTripGeneration(ItineraryRequest request) {
         try {
-            int totalPlaces = request.getDurationDays() * 4; // 4 activities per day
-            log.info("=== OTM-First Pipeline START: {} | {} days | {} places needed ===",
-                    request.getDestination(), request.getDurationDays(), totalPlaces);
+        // Calculate optimal pool size mathematically based on available time and companion type constraints
+        int dynamicPlacesPerDay = calculatePlacesPerDay(request);
+        int poolSize = request.getDurationDays() * dynamicPlacesPerDay;
+        
+        log.info("=== OTM-First Pipeline START: {} | {} days | {} places/day | Menu Pool: {} | group: {} | budget: {} ===",
+                request.getDestination(), request.getDurationDays(), dynamicPlacesPerDay, poolSize,
+                request.getGroupType(), request.getBudgetType());
 
             // =================================================================
             // PHASE 1: OTM FETCH → INTEREST FILTER → SELECTION
@@ -83,7 +95,7 @@ public class GenerationPipelineService {
                 candidatePlaces = extractAndFilterOtmPlaces(otmNode, request);
 
                 // If not enough places, widen radius and re-fetch (up to 80km)
-                while (candidatePlaces.size() < totalPlaces && radius < 80000) {
+                while (candidatePlaces.size() < poolSize && radius < 80000) {
                     radius += 15000;
                     log.info("Phase 1: Only {} places found, widening radius to {}m", candidatePlaces.size(), radius);
                     otmNode = openTripMapService.fetchBasePlaces(
@@ -95,58 +107,38 @@ public class GenerationPipelineService {
             }
 
             // Absolutely ensure we have the required number of places (invoking AI hallucination if OTM failed or under-delivered)
-            if (candidatePlaces.size() < totalPlaces) {
-                log.warn("OTM returned {}/{} places. Using AI fallback to generate the rest...", candidatePlaces.size(), totalPlaces);
+            if (candidatePlaces.size() < poolSize) {
+                log.warn("OTM returned {}/{} places. Using AI fallback to generate the rest...", candidatePlaces.size(), poolSize);
                 List<Activity> fallbackPlaces = aiFallbackService.generateFallbackPlaces(
-                        request.getDestination(), request.getLat(), request.getLng(), totalPlaces - candidatePlaces.size(), activeKinds);
+                        request.getDestination(), request.getLat(), request.getLng(), poolSize - candidatePlaces.size(), activeKinds);
                 candidatePlaces.addAll(fallbackPlaces);
             }
 
-            // Cap to exactly totalPlaces
-            if (candidatePlaces.size() > totalPlaces) {
-                candidatePlaces = candidatePlaces.subList(0, totalPlaces);
+            // Cap to exactly poolSize
+            if (candidatePlaces.size() > poolSize) {
+                candidatePlaces = candidatePlaces.subList(0, poolSize);
             }
             log.info("Phase 1 complete: {} places selected.", candidatePlaces.size());
 
             // =================================================================
-            // PHASE 2: ORS ROUTE OPTIMIZATION + TRANSIT TIMES (Matrix API)
+            // PHASE 2: VRP ROUTE OPTIMIZATION & WEATHER (Pool Pre-processing)
             // =================================================================
-            log.info("Phase 2: ORS route optimization for {} places...", candidatePlaces.size());
+            log.info("Phase 2: ORS VRP Route Optimization and per-place weather fetch...");
 
-            List<Activity> orderedPlaces = nearestNeighborSort(candidatePlaces);
-
-            // Build coordinate list for ORS Matrix API (single call for all durations)
-            List<double[]> coordList = new ArrayList<>();
-            for (Activity a : orderedPlaces) coordList.add(new double[]{a.getLatitude(), a.getLongitude()});
-
-            // ONE ORS batch call → all N-1 transit durations resolved at once
-            try {
-                String[] transitLabels = orsService.calculateTransitMatrix(coordList);
-                for (int i = 0; i < orderedPlaces.size(); i++) {
-                    orderedPlaces.get(i).setNextTransitDurationStr(transitLabels[i]);
-                    orderedPlaces.get(i).setRouteGeometry(null); 
-                    log.info("  Transit [{}→next]: {}", orderedPlaces.get(i).getPlaceName(), transitLabels[i]);
-                }
-                log.info("Phase 2 complete: {} transit durations resolved in 1 ORS Matrix call.", orderedPlaces.size() - 1);
-            } catch (Exception e) {
-                log.warn("CRITICAL ORS NETWORK FAILURE. Using rapid 20-min fallback transits: {}", e.getMessage());
-                for (int i = 0; i < orderedPlaces.size(); i++) {
-                    orderedPlaces.get(i).setNextTransitDurationStr("20 mins");
-                    orderedPlaces.get(i).setRouteGeometry(null);
-                }
+            // Use real ORS Vehicle Routing Problem optimization API
+            List<Activity> orderedPlaces = orsService.optimizeRoute(candidatePlaces);
+            
+            // Graceful geometry-only fallback if the API limits out or fails
+            if (orderedPlaces == null || orderedPlaces.isEmpty()) {
+                log.warn("ORS Optimization unavailable. Falling back to geometric Nearest-Neighbor sort.");
+                orderedPlaces = nearestNeighborSort(candidatePlaces);
             }
-
-            // =================================================================
-            // PHASE 3: PER-PLACE INDIVIDUAL WEATHER FETCH (most critical)
-            // =================================================================
-            log.info("Phase 3: Fetching per-place weather for every activity...");
-
-            LocalDate tripStartDate = LocalDate.parse(request.getStartDate().split("T")[0]);
-            int placesPerDay = 4;
+                        LocalDate tripStartDate = LocalDate.parse(request.getStartDate().split("T")[0]);
 
             for (int i = 0; i < orderedPlaces.size(); i++) {
                 Activity act = orderedPlaces.get(i);
-                int dayIndex = i / placesPerDay;
+                // Distribute weather queries logically across the trip days
+                int dayIndex = (int) (((double) i / poolSize) * request.getDurationDays());
                 LocalDate activityDate = tripStartDate.plusDays(dayIndex);
 
                 // Use predictive weather for the specific place + day
@@ -165,38 +157,61 @@ public class GenerationPipelineService {
                     act.setCriticalWeatherAlert(false);
                 }
             }
-            log.info("Phase 3 complete: per-place weather fetched for all {} activities.", orderedPlaces.size());
+            log.info("Phase 2 complete: per-place weather fetched for all {} menu activities.", orderedPlaces.size());
 
             // =================================================================
-            // PHASE 4: SINGLE AI FORMAT CALL — assign times/themes only
+            // PHASE 3: AI FORMATTING & PACING SELECTION
             // =================================================================
-            log.info("Phase 4: Single AI formatting call...");
+            log.info("Phase 3: Single AI formatting call (Selecting from pool)...");
 
-            String contextMatrix = buildContextMatrix(orderedPlaces, tripStartDate, placesPerDay);
-            String timeBounds = String.format("%02d:00 to %02d:00",
-                    request.getStartTime() != null ? request.getStartTime() : 8,
-                    request.getEndTime()   != null ? request.getEndTime()   : 18);
+            // We pass 6 so the context matrix uses 6 chunks for Day tagging hints
+            String contextMatrix = buildContextMatrix(orderedPlaces, tripStartDate, 6);
+            int start = request.getStartTime() != null ? request.getStartTime() : 8;
+            int end   = request.getEndTime()   != null ? request.getEndTime()   : 18;
+            double availableHours = Math.max(end - start, 4.0);
 
-            String aiSys = "You are a travel itinerary formatter. You receive a fixed ordered list of real places " +
-                    "with their OTM data, transit durations, and weather. Your ONLY job is to produce a final day-wise " +
-                    "JSON itinerary. Rules: (1) Do NOT add, remove, or reorder any places. (2) Assign realistic " +
-                    "startTime and endTime within the given daily window, accounting for transit gaps between places. " +
-                    "(3) Write a 2-sentence description for each place using its OTM kinds and rate for context. " +
-                    "(4) Give each day a short creative theme. " +
-                    "Return ONLY raw JSON: {\"days\":[{\"dayNumber\":1,\"theme\":\"string\",\"activities\":[" +
+            String timeBounds = String.format("%02d:00 to %02d:00", start, end);
+
+            // Companion-aware pacing guidance for the AI
+            String companionNote = switch (request.getGroupType() != null ? request.getGroupType().toLowerCase() : "couple") {
+                case "solo"    -> "Solo traveller — can move at a fast pace, squeeze in more stops.";
+                case "family"  -> "Family group — include rest gaps between activities, relaxed pace.";
+                case "friends" -> "Group of friends — allow social time at each location, moderate pace.";
+                default        -> "Couple — balanced pace with some leisure time at each place.";
+            };
+
+            String budgetLabel = switch (request.getBudgetType() != null ? request.getBudgetType().toLowerCase() : "normal") {
+                case "economy" -> "Economy (budget-friendly, prefer free/low-cost attractions)";
+                case "luxury"  -> "Luxury (premium experiences, high-end venues preferred)";
+                default        -> "Normal (mix of free and paid mid-range attractions)";
+            };
+            double derivedBudget = request.getDerivedBudget();
+
+            String aiSys = "You are a travel itinerary formatter with a deep knowledge of global tourism economics. You receive a fixed ordered list of candidate places " +
+                    "with their OTM data and weather. Your ONLY job is to produce a final day-wise " +
+                    "JSON itinerary. Rules: " +
+                    "(1) You MUST select a realistic subset of the provided places. DO NOT hallucinate places not on the list. Maintain their general geographical sequence if possible. " +
+                    "(2) CRITICAL TIMING RULE: Assign realistic startTime and endTime STRICTLY within the given daily window. " +
+                    "No activity may start before or end after the window. Factor 15-30min transit gaps between activities. " +
+                    "(3) Adjust visit duration per place and total places per day based on the companion type — families and groups need more time per stop and fewer stops in total. " +
+                    "(4) Write a 2-sentence description for each place using its OTM kinds and rate for context. " +
+                    "(5) Give each day a short creative theme. " +
+                    "(6) Dynamically calculate a realistic 'estimatedCost' (in INR) for each Day based on the destination region, budget tier, and places scheduled. Factor in entry fees, average meals, and transport. " +
+                    "Return ONLY raw JSON: {\"days\":[{\"dayNumber\":1,\"theme\":\"string\",\"estimatedCost\":2500,\"activities\":[" +
                     "{\"placeName\":\"string\",\"startTime\":\"09:00\",\"endTime\":\"10:30\",\"description\":\"string\"}]}]}";
 
             String aiPrompt = "Format the following " + request.getDurationDays() + "-day itinerary for "
                     + request.getDestination() + ".\n"
-                    + "Daily window: " + timeBounds + " | Group: " + request.getGroupType()
-                    + " | Budget: ₹" + (request.getBudget() != null ? String.format("%.0f", request.getBudget()) : "50000") + "\n"
-                    + "IMPORTANT: All " + orderedPlaces.size() + " places below MUST appear in the output. "
-                    + "Spread them across exactly " + request.getDurationDays() + " days (4 places/day). "
-                    + "Factor transit time into scheduling — do not overlap activities.\n\n"
+                    + "DAILY WINDOW: " + timeBounds + " | Group: " + request.getGroupType()
+                    + " | Budget Tier: " + budgetLabel + " (Note: Destination cost-of-living applies. Provide realistic INR daily costs.)\n"
+                    + "COMPANION CONTEXT: " + companionNote + "\n"
+                    + "SCHEDULING: All " + orderedPlaces.size() + " places below MUST appear in the output. "
+                    + "This list has been mathematically paced for the available hours (" + availableHours + "h) and " + request.getGroupType() + " group pace. "
+                    + "Factor proper transit time into scheduling — do not under OR overpack.\n\n"
                     + contextMatrix;
 
             String rawAiJson = aiFallbackService.callAi(aiSys, aiPrompt);
-            log.info("Phase 4 AI raw output length: {} chars", rawAiJson.length());
+            log.info("Phase 3 AI raw output length: {} chars", rawAiJson.length());
 
             String cleanedAiJson = rawAiJson.replaceAll("(?s)```json", "").replaceAll("```", "").trim();
 
@@ -208,7 +223,7 @@ public class GenerationPipelineService {
             itinerary.setDestinationLat(request.getLat());
             itinerary.setDestinationLng(request.getLng());
             itinerary.setNumberOfDays(request.getDurationDays());
-            itinerary.setBudget(request.getBudget() != null ? request.getBudget() : 50000.0);
+            itinerary.setBudget(request.getDerivedBudget());
             itinerary.setGroupType(request.getGroupType() != null ? request.getGroupType() : "Couple");
             itinerary.setStartDate(tripStartDate);
             itinerary.setEndDate(LocalDate.parse(request.getEndDate().split("T")[0]));
@@ -233,6 +248,7 @@ public class GenerationPipelineService {
                     day.setDayNumber(dayNode.has("dayNumber") ? dayNode.get("dayNumber").asInt() : 1);
                     day.setDate(tripStartDate.plusDays(day.getDayNumber() - 1));
                     day.setTheme(dayNode.has("theme") ? dayNode.get("theme").asText() : "Exploration Day");
+                    day.setEstimatedCost(dayNode.has("estimatedCost") ? dayNode.get("estimatedCost").asDouble() : request.getDerivedBudget() / request.getDurationDays());
                     day.setActivities(new ArrayList<>());
 
                     JsonNode actArray = dayNode.get("activities");
@@ -263,8 +279,8 @@ public class GenerationPipelineService {
                             finalAct.setOtmKinds(realData.getOtmKinds());        // OTM categories
                             finalAct.setWeatherCondition(realData.getWeatherCondition());
                             finalAct.setCriticalWeatherAlert(realData.isCriticalWeatherAlert());
-                            finalAct.setNextTransitDurationStr(realData.getNextTransitDurationStr());
-                            finalAct.setRouteGeometry(realData.getRouteGeometry());
+                            finalAct.setRouteGeometry(null); // Calculated in Phase 4
+                            finalAct.setNextTransitDurationStr(null); // Calculated in Phase 4
                             finalAct.setStartTime(aNode.has("startTime") ? aNode.get("startTime").asText() : "09:00");
                             finalAct.setEndTime(aNode.has("endTime")     ? aNode.get("endTime").asText()   : "10:30");
                             finalAct.setDescription(aNode.has("description") ? aNode.get("description").asText() : "A curated stop at this location.");
@@ -277,32 +293,8 @@ public class GenerationPipelineService {
                 }
             }
 
-            // Safety: if any orderedPlaces were not placed by AI (e.g. AI truncated output),
-            // append them to the last day to prevent data loss
-            if (!dataMap.isEmpty()) {
-                log.warn("AI did not schedule {} places — appending to last day as safety.", dataMap.size());
-                ItineraryDay lastDay = itinerary.getDays().isEmpty() ? null
-                        : itinerary.getDays().get(itinerary.getDays().size() - 1);
-                if (lastDay != null) {
-                    for (Activity leftover : dataMap.values()) {
-                        Activity finalAct = new Activity();
-                        finalAct.setDay(lastDay);
-                        finalAct.setPlaceName(leftover.getPlaceName());
-                        finalAct.setLatitude(leftover.getLatitude());
-                        finalAct.setLongitude(leftover.getLongitude());
-                        finalAct.setOtmRate(leftover.getOtmRate());
-                        finalAct.setOtmKinds(leftover.getOtmKinds());
-                        finalAct.setWeatherCondition(leftover.getWeatherCondition());
-                        finalAct.setCriticalWeatherAlert(leftover.isCriticalWeatherAlert());
-                        finalAct.setNextTransitDurationStr(leftover.getNextTransitDurationStr());
-                        finalAct.setRouteGeometry(leftover.getRouteGeometry());
-                        finalAct.setStartTime("18:00");
-                        finalAct.setEndTime("19:00");
-                        finalAct.setDescription("A notable location worth visiting.");
-                        lastDay.getActivities().add(finalAct);
-                    }
-                }
-            }
+            // Note: Leftover places in dataMap are intentionally discarded to respect the AI's paced subset.
+
 
             // Sync User + Expense Ledger
             if (request.getFirebaseUid() != null && !request.getFirebaseUid().isBlank()) {
@@ -316,10 +308,55 @@ public class GenerationPipelineService {
                 }
                 itinerary.setUser(user);
             }
+
+            // =================================================================
+            // PHASE 4: PRECISE TRANSIT MATRIX CALCULATION (Post-Selection)
+            // =================================================================
+            log.info("Phase 4: Calculating exact ORS Transit Matrix for AI-selected places...");
+            List<Activity> finalSelectedActivities = new ArrayList<>();
+            for (ItineraryDay d : itinerary.getDays()) {
+                if (d.getActivities() != null) {
+                    finalSelectedActivities.addAll(d.getActivities());
+                }
+            }
+            
+            if (!finalSelectedActivities.isEmpty()) {
+                List<double[]> finalCoords = new ArrayList<>();
+                for (Activity a : finalSelectedActivities) {
+                    finalCoords.add(new double[]{a.getLatitude(), a.getLongitude()});
+                }
+                try {
+                    String[] transitLabels = orsService.calculateTransitMatrix(finalCoords);
+                    for (int i = 0; i < finalSelectedActivities.size(); i++) {
+                        finalSelectedActivities.get(i).setNextTransitDurationStr(transitLabels[i]);
+                        log.info("  Transit Chosen [{}→next]: {}", finalSelectedActivities.get(i).getPlaceName(), transitLabels[i]);
+                    }
+                    log.info("Phase 4 complete: {} precise transit durations resolved.", finalSelectedActivities.size() - 1);
+                } catch (Exception e) {
+                    log.warn("ORS NETWORK FAILURE inside post-processing. Using rapid fallback transits: {}", e.getMessage());
+                    for (int i = 0; i < finalSelectedActivities.size(); i++) {
+                        finalSelectedActivities.get(i).setNextTransitDurationStr("15 mins");
+                    }
+                }
+            }
+
+            // ─── Post-Process Dynamic Budget calculation ─────────────────────────────────
+            // Aggregate all the daily estimated costs the AI provided into the overall itinerary budget
+            double totalCalculatedBudget = 0.0;
+            for (ItineraryDay d : itinerary.getDays()) {
+                if (d.getEstimatedCost() != null) {
+                    totalCalculatedBudget += d.getEstimatedCost();
+                } else {
+                    totalCalculatedBudget += (request.getDerivedBudget() / request.getDurationDays());
+                }
+            }
+            itinerary.setBudget(totalCalculatedBudget);
+
+            // Expense Tracker logic...
             ExpenseTracker tracker = new ExpenseTracker();
             tracker.setItinerary(itinerary);
             // Link the specific user-provided budget from the request to the financial ledger
-            tracker.setBaseBudgetLimit(request.getBudget() != null ? request.getBudget() : 50000.0);
+            tracker.setBaseBudgetLimit(totalCalculatedBudget);
             tracker.setMemberNames(new ArrayList<>());
             itinerary.setExpenseTracker(tracker);
 
@@ -335,7 +372,7 @@ public class GenerationPipelineService {
         }
     }
 
-    // ─── OTM Extraction + Interest Filtering ─────────────────────────────────
+    // ─── OTM Extraction + Strict Tourist-Only Filtering ──────────────────────────
 
     private List<Activity> extractAndFilterOtmPlaces(JsonNode otmNode, ItineraryRequest request) {
         List<Activity> result = new ArrayList<>();
@@ -345,14 +382,15 @@ public class GenerationPipelineService {
 
         java.util.Set<String> seenNames = new java.util.HashSet<>();
 
-        // Build blocked kinds (score == 0 = Not Interested → omit)
+        // Build blocked kinds (user score == 0 = Not Interested)
         java.util.Set<String> blockedKinds = new java.util.HashSet<>();
-        // Build priority kinds (score == 2 = Interested → must include, sort to top)
+        // Build priority kinds (user score == 2 = Interested → sort to top)
         java.util.Set<String> priorityKinds = new java.util.HashSet<>();
 
         if (request.getInterests() != null) {
             for (Map.Entry<String, Integer> entry : request.getInterests().entrySet()) {
-                String[] mapped = INTEREST_OTM_MAP.get(entry.getKey().toLowerCase());
+                String normalizedKey = entry.getKey().toLowerCase().replace(" ", "").replace("_", "").replace("-", "");
+                String[] mapped = INTEREST_OTM_MAP.get(normalizedKey);
                 if (mapped == null) continue;
                 int score = entry.getValue() == null ? 1 : entry.getValue();
                 if (score == 0) {
@@ -360,37 +398,51 @@ public class GenerationPipelineService {
                 } else if (score == 2) {
                     for (String k : mapped) priorityKinds.add(k);
                 }
-                // score == 1 (Curious) = include normally, no action needed
             }
         }
-        log.info("Phase 1 interest filter — blocked: {} | priority: {}", blockedKinds, priorityKinds);
+        log.info("Phase 1 filter — blocked: {} | priority: {}", blockedKinds, priorityKinds);
+
+        int totalRaw = 0, rejectedNoName = 0, rejectedNoRate = 0, rejectedNonTouristKind = 0,
+                rejectedNonTouristName = 0, rejectedBlocked = 0, rejectedDuplicate = 0, rejectedNoCoords = 0;
 
         for (JsonNode feature : otmNode.get("features")) {
+            totalRaw++;
             JsonNode props = feature.path("properties");
+
+            // ── 1. Must have a name ──────────────────────────────────────────────
             String name = props.path("name").asText("").trim();
-            if (name.isEmpty() || isCorporateOrMundane(name)) continue;
+            if (name.isEmpty()) { rejectedNoName++; continue; }
+
+            // ── 2. Must have a non-zero OTM rate (unrated = unknown place) ───────
+            double rate = props.path("rate").asDouble(-1.0);
+            if (rate <= 0.0) { rejectedNoRate++; continue; }
+
+            // ── 3. Must have valid coordinates ────────────────────────────────────
+            double lng = feature.path("geometry").path("coordinates").path(0).asDouble();
+            double lat = feature.path("geometry").path("coordinates").path(1).asDouble();
+            if (lat == 0.0 && lng == 0.0) { rejectedNoCoords++; continue; }
 
             String kinds = props.path("kinds").asText("").toLowerCase();
 
-            // Skip blocked kinds (score == 0)
+            // ── 4. Reject non-tourist kinds via kinds string (contains check) ─────
+            if (isNonTouristKind(kinds)) { rejectedNonTouristKind++; continue; }
+
+            // ── 5. Reject non-tourist / mundane names ────────────────────────────
+            if (isNonTouristName(name)) { rejectedNonTouristName++; continue; }
+
+            // ── 6. Reject blocked interest kinds (user score == 0) ───────────────
             boolean blocked = false;
             for (String bk : blockedKinds) {
                 if (kinds.contains(bk)) { blocked = true; break; }
             }
-            if (blocked) continue;
+            if (blocked) { rejectedBlocked++; continue; }
 
-            // Deduplication
+            // ── 7. Deduplication ─────────────────────────────────────────────────
             String normName = normalizeName(name);
-            if (seenNames.contains(normName) || normName.length() < 3) continue;
+            if (seenNames.contains(normName) || normName.length() < 3) { rejectedDuplicate++; continue; }
             seenNames.add(normName);
 
-            double lng = feature.path("geometry").path("coordinates").path(0).asDouble();
-            double lat = feature.path("geometry").path("coordinates").path(1).asDouble();
-            if (lat == 0.0 && lng == 0.0) continue;
-
-            double rate = props.path("rate").asDouble(0.0);
-
-            // Check if this place matches a priority kind (score == 2)
+            // ── 8. Priority boost for user's Interested categories ───────────────
             boolean isPriority = false;
             for (String pk : priorityKinds) {
                 if (kinds.contains(pk)) { isPriority = true; break; }
@@ -400,17 +452,21 @@ public class GenerationPipelineService {
             act.setPlaceName(name);
             act.setLatitude(lat);
             act.setLongitude(lng);
-            act.setOtmRate(isPriority ? rate + 100.0 : rate); // Boost priority places to top
-            act.setOtmKinds(kinds.length() > 100 ? kinds.substring(0, 100) : kinds);
+            act.setOtmRate(isPriority ? rate + 100.0 : rate);
+            act.setOtmKinds(kinds.length() > 120 ? kinds.substring(0, 120) : kinds);
             result.add(act);
         }
 
-        // Sort by effective score descending (priority places first, then by OTM rate)
+        log.info("Phase 1 filter stats — raw:{} | passed:{} | noName:{} | noRate:{} | noCoords:{} | nonTouristKind:{} | nonTouristName:{} | blocked:{} | duplicate:{}",
+                totalRaw, result.size(), rejectedNoName, rejectedNoRate, rejectedNoCoords,
+                rejectedNonTouristKind, rejectedNonTouristName, rejectedBlocked, rejectedDuplicate);
+
+        // Sort: priority (Interested) places first, then by OTM rate descending
         result.sort((a, b) -> Double.compare(
                 b.getOtmRate() != null ? b.getOtmRate() : 0.0,
                 a.getOtmRate() != null ? a.getOtmRate() : 0.0));
 
-        // Restore real OTM rate after sorting (remove the +100 boost)
+        // Restore real OTM rate (remove the +100 priority boost used for sorting)
         result.forEach(a -> {
             if (a.getOtmRate() != null && a.getOtmRate() > 10.0) {
                 a.setOtmRate(a.getOtmRate() - 100.0);
@@ -419,25 +475,58 @@ public class GenerationPipelineService {
         return result;
     }
 
-    // ─── Build dynamic OTM kinds string from user's active interests ───────────────────
-    // Collects kinds for score >= 1 (Curious or Interested), deduplicates, joins with comma.
-    // Result: "historic,cultural,natural,catering" — sent directly to the OTM kinds= param.
+
+    // ─── Dynamic places-per-day calculation ──────────────────────────────────────
+    // Based on: available travel hours × companion pace factor ÷ avg slot (1.5 hrs each)
+    // Solo moves fastest; Family needs the most buffer time.
+
+    private int calculatePlacesPerDay(ItineraryRequest request) {
+        int start = request.getStartTime() != null ? request.getStartTime() : 9;
+        int end   = request.getEndTime()   != null ? request.getEndTime()   : 18;
+        double availableHours = Math.max(end - start, 4.0); // minimum 4h enforced
+
+        // Reserve ~1 hr for meals/breaks; each activity slot = avg 1.5 hrs (visit + transit)
+        double effectiveHours = Math.max(availableHours - 1.0, 2.0);
+        int rawCount = (int) (effectiveHours / 1.5);
+
+        // Adjust per companion type
+        String group = request.getGroupType() != null ? request.getGroupType().toLowerCase() : "couple";
+        rawCount = switch (group) {
+            case "family"  -> rawCount - 1;   // slower pace, kids/elders need buffer
+            case "friends" -> rawCount;        // social stops, moderate pace
+            case "solo"    -> rawCount + 1;    // fast mover, fits extra stops
+            default        -> rawCount;        // couple — baseline
+        };
+
+        int result = Math.max(2, Math.min(rawCount, 6)); // clamp 2–6 depending on time tightness
+        log.info("calculatePlacesPerDay: {}h window | group={} | raw={} | final={}",
+                availableHours, group, rawCount, result);
+        return result;
+    }
+
+    // ─── Build OTM kinds string for the fetch ────────────────────────────────────
+    // OTM API IMPORTANT: The API rejects comma-separated mixed top-level kinds (400 error).
+    // The correct approach: always fetch with "interesting_places" (OTM umbrella for all tourist POIs),
+    // then apply the user's interest filter POST-FETCH via extractAndFilterOtmPlaces().
+    // This method logs the incoming interests for debugging only.
 
     private String buildActiveKinds(ItineraryRequest request) {
         if (request.getInterests() == null || request.getInterests().isEmpty()) {
-            return "interesting_places"; // safe fallback
-        }
-        java.util.Set<String> kindsSet = new java.util.LinkedHashSet<>();
-        for (Map.Entry<String, Integer> entry : request.getInterests().entrySet()) {
-            int score = entry.getValue() == null ? 1 : entry.getValue();
-            if (score >= 1) { // Curious or Interested → include
-                String[] mapped = INTEREST_OTM_MAP.get(entry.getKey().toLowerCase().replace(" ", ""));
-                if (mapped != null) {
-                    for (String k : mapped) kindsSet.add(k);
-                }
+            log.warn("buildActiveKinds: interests map is NULL or EMPTY");
+        } else {
+            log.info("buildActiveKinds: raw interests from frontend → {}", request.getInterests());
+            for (Map.Entry<String, Integer> entry : request.getInterests().entrySet()) {
+                String rawKey = entry.getKey();
+                String normalizedKey = rawKey.toLowerCase().replace(" ", "").replace("_", "").replace("-", "");
+                int score = entry.getValue() == null ? 1 : entry.getValue();
+                String[] mapped = INTEREST_OTM_MAP.get(normalizedKey);
+                log.info("  interest key: '{}' → normalized: '{}' | score: {} | filter-kinds: {}",
+                        rawKey, normalizedKey, score, mapped != null ? java.util.Arrays.toString(mapped) : "NO MATCH");
             }
         }
-        return kindsSet.isEmpty() ? "interesting_places" : String.join(",", kindsSet);
+        // Always use the OTM umbrella kind — post-fetch filter applies user interests
+        log.info("buildActiveKinds: OTM fetch kind → [interesting_places] (post-fetch filter applies interests)");
+        return "interesting_places";
     }
 
     // ─── Nearest-Neighbor TSP (deterministic, no AI) ──────────────────────────────
@@ -518,22 +607,60 @@ public class GenerationPipelineService {
         return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
     }
 
-    private boolean isCorporateOrMundane(String name) {
+    /**
+     * Rejects places whose OTM kinds string contains non-tourist infrastructure kinds.
+     * Uses contains-check on the full kinds string (OTM returns comma-separated sub-kinds).
+     * A place is blocked if ANY of its kinds indicate it is NOT a tourist destination.
+     */
+    private boolean isNonTouristKind(String kinds) {
+        if (kinds == null || kinds.isBlank()) return true; // no kinds = unknown, reject
+        // These OTM kind tokens indicate non-tourist places — reject if found anywhere in kinds string
+        return kinds.contains("banks") || kinds.contains("atm") ||
+               kinds.contains("hospitals") || kinds.contains("emergency") || kinds.contains("health") ||
+               kinds.contains("clinics") || kinds.contains("pharmacy") || kinds.contains("medical") ||
+               kinds.contains("police") || kinds.contains("fire_station") ||
+               kinds.contains("schools") || kinds.contains("colleges") || kinds.contains("universities") ||
+               kinds.contains("kindergartens") || kinds.contains("education") ||
+               kinds.contains("bus_stops") || kinds.contains("bus_stations") || kinds.contains("railways") ||
+               kinds.contains("airports") || kinds.contains("metro") || kinds.contains("transport") ||
+               kinds.contains("gas_stations") || kinds.contains("fuel") || kinds.contains("parking") ||
+               kinds.contains("supermarkets") || kinds.contains("convenience") || kinds.contains("marketplace") ||
+               kinds.contains("industrial") || kinds.contains("factories") || kinds.contains("offices") ||
+               kinds.contains("government") || kinds.contains("administrative") ||
+               kinds.contains("waste") || kinds.contains("water_utilities") ||
+               kinds.contains("cemeteries") || kinds.contains("cemetery") ||
+               kinds.contains("guest_houses") || kinds.contains("hostels") || kinds.contains("campsites") ||
+               kinds.contains("other");
+    }
+
+    /**
+     * Rejects places whose NAME contains non-tourist or mundane keywords.
+     * This is a secondary safety net over the kinds filter.
+     */
+    private boolean isNonTouristName(String name) {
         if (name == null) return true;
         String lower = name.toLowerCase();
-        return lower.contains("bank") || lower.contains("atm") || lower.contains("hospital") ||
-               lower.contains("clinic") || lower.contains("school") || lower.contains("college") ||
-               lower.contains("university") || lower.contains("institute") || lower.contains("gym") ||
-               lower.contains("grocery") || lower.contains("supermarket") || lower.contains("petrol") ||
-               lower.contains("gas station") || lower.contains("police") || lower.contains("post office") ||
-               lower.contains("bus stop") || lower.contains("typewriting") || lower.contains("tuition") ||
-               lower.contains("pvt") || lower.contains("ltd") || lower.contains("corporation") ||
-               lower.contains("hotel") || lower.contains("lodge") || lower.contains("restaurant") ||
-               lower.contains("bakery") || lower.contains("store") || lower.contains("shop") ||
-               lower.contains("mart") || lower.contains("parlor") || lower.contains("parlour") ||
-               lower.contains("beer") || lower.contains("wine") || lower.contains("liquor") ||
-               lower.contains("ration") || lower.contains("indian oil") || lower.contains("bharat petroleum") ||
-               lower.contains("farm ") || lower.contains("office") || lower.contains("agency") ||
-               lower.contains("convent") || lower.contains("collective farm");
+        // Infrastructure / medical / education / transit
+        return lower.contains("hospital")   || lower.contains("clinic")      || lower.contains("nursing home")  ||
+               lower.contains("dispensary") || lower.contains("pharmacy")    || lower.contains("medical")       ||
+               lower.contains("dental")     || lower.contains("dentist")     || lower.contains("health centre") ||
+               lower.contains("health center") ||
+               lower.contains("school")     || lower.contains("college")     || lower.contains("university")    ||
+               lower.contains("institute")  || lower.contains("academy")     || lower.contains("polytechnic")   ||
+               lower.contains("degree")     || lower.contains("tuition")     || lower.contains("coaching")      ||
+               lower.contains("training")   || lower.contains("hostel")      ||
+               lower.contains("bus stop")   || lower.contains("bus stand")   || lower.contains("bus terminus")  ||
+               lower.contains("railway")    || lower.contains("metro station")|| lower.contains("airport")       ||
+               lower.contains("bank")       || lower.contains(" atm")        || lower.contains("finance")       ||
+               lower.contains("police")     || lower.contains("fire station") || lower.contains("post office")   ||
+               lower.contains("government office") || lower.contains("collectorate") ||
+               lower.contains("petrol")     || lower.contains("gas station")  || lower.contains("fuel")          ||
+               lower.contains("indian oil") || lower.contains("bharat petroleum") || lower.contains("hp petrol") ||
+               lower.contains("supermarket")|| lower.contains("grocery")     || lower.contains(" mart")         ||
+               lower.contains(" store")     || lower.contains("pvt ltd")      || lower.contains("pvt.")          ||
+               lower.contains(" ltd")       || lower.contains("distributor")  || lower.contains("agency")        ||
+               lower.contains("typewriting")|| lower.contains("collective farm")|| lower.contains("farm house")  ||
+               lower.contains("parking")    || lower.contains("cemetery")    || lower.contains("sewage")        ||
+               lower.contains("water tank") || lower.contains("overhead tank")|| lower.contains("transformer");
     }
 }

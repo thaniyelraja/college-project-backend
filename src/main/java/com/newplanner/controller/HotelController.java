@@ -24,7 +24,7 @@ import java.util.Map;
 @RequestMapping("/hotels")
 @RequiredArgsConstructor
 @Slf4j
-@CrossOrigin(origins = "http://localhost:3000")
+
 public class HotelController {
 
     private final ApiKeyRotationService keyService;

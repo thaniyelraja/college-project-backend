@@ -22,7 +22,7 @@ import java.util.List;
 @RequestMapping("/users")
 @RequiredArgsConstructor
 @Slf4j
-@CrossOrigin(origins = "http://localhost:3000")
+
 public class UserController {
 
     private final UserRepository userRepository;
@@ -44,5 +44,20 @@ public class UserController {
         userRepository.deleteById(firebaseUid);
         log.info("Account deleted from DB: {}", firebaseUid);
         return ResponseEntity.noContent().build();
+    }
+
+    @GetMapping("/exists/{firebaseUid}")
+    public ResponseEntity<Boolean> checkUserExists(@PathVariable String firebaseUid) {
+        return ResponseEntity.ok(userRepository.existsById(firebaseUid));
+    }
+
+    @PostMapping
+    public ResponseEntity<com.newplanner.entity.User> createUser(@RequestBody com.newplanner.entity.User user) {
+        if (userRepository.existsById(user.getFirebaseUid())) {
+            log.warn("User {} already exists in DB", user.getFirebaseUid());
+            return ResponseEntity.badRequest().build();
+        }
+        log.info("Created new user in DB: {}", user.getFirebaseUid());
+        return ResponseEntity.ok(userRepository.save(user));
     }
 }

@@ -22,7 +22,7 @@ import java.util.concurrent.CompletableFuture;
 @RequestMapping("/trips")
 @RequiredArgsConstructor
 @Slf4j
-@CrossOrigin(origins = "http://localhost:3000")
+
 public class TripController {
 
     private final GenerationPipelineService pipelineService;
@@ -183,22 +183,5 @@ public class TripController {
                 });
     }
 
-    /** GET /trips/routing/directions — safely proxies real driving directions without exposing API keys */
-    @GetMapping("/routing/directions")
-    public ResponseEntity<?> getLiveDirections(
-            @RequestParam Double startLat, @RequestParam Double startLng,
-            @RequestParam Double endLat, @RequestParam Double endLng) {
-        log.info("Proxying manual live road routing from [{}, {}] to [{}, {}]", startLat, startLng, endLat, endLng);
-        try {
-            com.newplanner.service.OrsRoutingService.RoutingResult result =
-                updateService.getOrsRoutingService().calculateTransitDuration(startLat, startLng, endLat, endLng);
-            return ResponseEntity.ok(Map.of(
-                "duration", result.durationStr,
-                "geometry", result.geometryStr != null ? result.geometryStr : ""
-            ));
-        } catch (Exception e) {
-            log.error("Live routing request proxy failed: {}", e.getMessage());
-            return ResponseEntity.internalServerError().body(Map.of("error", "Unable to route via ORS proxy"));
-        }
-    }
+
 }

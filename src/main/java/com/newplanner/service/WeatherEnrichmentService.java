@@ -61,7 +61,7 @@ public class WeatherEnrichmentService {
 
         java.time.LocalDate now = java.time.LocalDate.now();
         if (targetDate.isAfter(now.plusDays(4)) || targetDate.isBefore(now)) {
-            return deriveWeatherCondition(lat, lng); // Outside 5-day window, use current
+            return new String[]{"Forecast unavailable", "false"}; // Outside 5-day window
         }
 
         String formattedTime = (timeStr != null && timeStr.contains(":"))
