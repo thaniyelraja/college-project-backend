@@ -232,8 +232,13 @@ public class GenerationPipelineService {
             }
             itinerary.setDays(new ArrayList<>());
 
-            JsonNode aiRoot = objectMapper.readTree(cleanedAiJson);
-            JsonNode daysNode = aiRoot.has("days") ? aiRoot.get("days") : aiRoot;
+            JsonNode daysNode = null;
+            try {
+                JsonNode aiRoot = objectMapper.readTree(cleanedAiJson);
+                daysNode = aiRoot.has("days") ? aiRoot.get("days") : aiRoot;
+            } catch (Exception ex) {
+                log.warn("AI JSON Parsing Failed. Extracting programmatic fallback itinerary natively...", ex);
+            }
 
             // Build a lookup map: normalised name → ordered Activity (with real OTM data)
             java.util.Map<String, Activity> dataMap = new java.util.LinkedHashMap<>();
@@ -291,6 +296,44 @@ public class GenerationPipelineService {
 
                             day.getActivities().add(finalAct);
                         }
+                    }
+                    itinerary.getDays().add(day);
+                }
+            } else {
+                // FALLBACK: Programmatically chunk the OTM locations to guarantee delivery
+                log.info("Executing mathematical fallback allocation for {} days...", request.getDurationDays());
+                int placesPerDay = Math.max(1, orderedPlaces.size() / request.getDurationDays());
+                int placeIndex = 0;
+                
+                for (int d = 1; d <= request.getDurationDays(); d++) {
+                    ItineraryDay day = new ItineraryDay();
+                    day.setItinerary(itinerary);
+                    day.setDayNumber(d);
+                    day.setDate(tripStartDate.plusDays(d - 1));
+                    day.setTheme("Exploration & Discovery");
+                    day.setEstimatedCost(request.getDerivedBudget() / request.getDurationDays());
+                    day.setActivities(new ArrayList<>());
+                    
+                    for (int p = 0; p < placesPerDay && placeIndex < orderedPlaces.size(); p++) {
+                        Activity realData = orderedPlaces.get(placeIndex++);
+                        Activity finalAct = new Activity();
+                        finalAct.setDay(day);
+                        finalAct.setPlaceName(realData.getPlaceName());
+                        finalAct.setLatitude(realData.getLatitude());
+                        finalAct.setLongitude(realData.getLongitude());
+                        finalAct.setOtmRate(realData.getOtmRate());
+                        finalAct.setOtmKinds(realData.getOtmKinds());
+                        finalAct.setWeatherCondition(realData.getWeatherCondition());
+                        finalAct.setCriticalWeatherAlert(realData.isCriticalWeatherAlert());
+                        finalAct.setRouteGeometry(null);
+                        finalAct.setNextTransitDurationStr(null);
+                        
+                        int startHour = 9 + (p * 2);
+                        finalAct.setStartTime(String.format("%02d:00", Math.min(22, startHour)));
+                        finalAct.setEndTime(String.format("%02d:30", Math.min(23, startHour + 1)));
+                        finalAct.setDescription("A curated stop at this destination.");
+                        finalAct.setFoodBlock(false);
+                        day.getActivities().add(finalAct);
                     }
                     itinerary.getDays().add(day);
                 }
